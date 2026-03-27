@@ -2,19 +2,22 @@
 """
 Standalone TPS sweep benchmark for vLLM (OpenAI-compatible completions API).
 
-Measures output tokens/sec at varying concurrency levels (batch sizes) WITHOUT
-restarting the server.  Batch size is controlled via asyncio.Semaphore on the
-client; the server must be started with --max-num-seqs >= max(BATCH_SIZES).
-
-Results are saved per batch size as JSON files and printed as a summary table.
+Key design choices:
+  - No server restarts: batch size is controlled via asyncio.Semaphore on the
+    client; the server must be started with --max-num-seqs >= max(BATCH_SIZES).
+  - Unique per-request prompts: every prompt starts with a UUID hex prefix, so
+    prefix caching gives zero benefit across requests (no shared KV blocks).
+  - Long-answer prompts: prompts are structured to elicit ~OUTPUT_LEN tokens.
+  - Saturation detection: polls /metrics for vllm:num_requests_waiting; stops
+    the sweep when the KV cache fills (3+ consecutive non-zero readings).
 
 Usage:
   python tps_sweep_minimal.py \\
     --model qwen35 \\
     --base-url http://localhost:8000 \\
-    --batch-sizes 1,2,4,8,16,32,64,128 \\
-    --input-len 512 \\
-    --output-len 512 \\
+    --batch-sizes 1,2,4,8,16,32,64,128,256,512,1024,2048,4096 \\
+    --input-len 1024 \\
+    --output-len 1024 \\
     --num-prompts 200 \\
     --num-warmup 20 \\
     --results-dir ../results/qwen35
@@ -26,7 +29,8 @@ import argparse
 import asyncio
 import json
 import time
-from dataclasses import asdict, dataclass
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -36,25 +40,208 @@ import aiohttp
 # Prompt generation
 # ---------------------------------------------------------------------------
 
-_BASE_WORDS = (
-    "the quick brown fox jumps over the lazy dog in a bustling city where "
-    "many different large language models are deployed on powerful compute "
-    "clusters running parallel inference workloads generating text at scale "
-).split()
+# Diverse technical topics — rotated across requests so adjacent prompts differ
+_TOPICS = [
+    "KV cache management and memory allocation in LLM inference engines",
+    "distributed consensus beyond Raft: EPaxos, Hermes, and Flexible Paxos",
+    "memory allocator design for latency-sensitive systems (jemalloc, mimalloc, tcmalloc)",
+    "tensor and expert parallelism strategies in large model training and inference",
+    "lock-free and wait-free data structures: algorithms, correctness proofs, pitfalls",
+    "storage engine design trade-offs: B-tree vs LSM-tree vs COLA",
+    "speculative decoding: draft model selection, verification batching, acceptance rates",
+    "NUMA-aware scheduling and memory placement in multi-socket servers",
+    "RDMA and kernel-bypass networking for high-throughput distributed systems",
+    "continuous batching in LLM serving: iteration-level scheduling and preemption",
+    "write-optimized databases: compaction strategies, read amplification, space overhead",
+    "GPU memory hierarchy: L1/L2 caches, shared memory, register files, coalescing",
+    "disaggregated prefill and decode in LLM inference: latency and throughput trade-offs",
+    "network function virtualization: DPDK, XDP, eBPF packet processing pipelines",
+    "compiler optimizations for heterogeneous compute: auto-vectorization, loop tiling, fusion",
+    "CRDTs and eventual consistency models in distributed databases",
+    "persistent memory (Optane) programming models and failure-atomicity primitives",
+    "tail latency in distributed systems: causes, measurement, and mitigation strategies",
+    "flash attention and memory-efficient attention variants: FlashAttention-2, PagedAttention",
+    "prefix trees (tries) in IP routing, autocompletion, and key-value index structures",
+]
+
+# Padding passages — varied so long prompts don't repeat the same paragraph
+_PASSAGES = [
+    "Modern computing systems face fundamental trade-offs between throughput, latency, "
+    "energy efficiency, and fault tolerance. Every design decision carries implications "
+    "across multiple dimensions that must be evaluated against specific workload "
+    "characteristics, hardware capabilities, and operational constraints.",
+
+    "Tail latency — particularly at the 99th and 99.9th percentiles — often determines "
+    "practical system usability in production environments where SLA violations carry "
+    "financial and reputational consequences. Understanding the sources of latency variance "
+    "is prerequisite to any effective mitigation strategy.",
+
+    "The memory hierarchy of modern processors spans registers, L1/L2/L3 caches, main "
+    "memory, and persistent storage, each differing by orders of magnitude in bandwidth, "
+    "latency, and capacity. Algorithms and data structures must be designed with explicit "
+    "awareness of these tiers to achieve competitive performance.",
+
+    "Concurrency control in multi-core systems requires careful reasoning about cache "
+    "coherence protocols, memory ordering, and the interaction between hardware and "
+    "compiler optimizations. Lock-free algorithms offer scalability advantages but "
+    "demand rigorous correctness arguments under all observable execution interleavings.",
+
+    "Distributed systems are defined by partial failure: individual components may fail "
+    "independently while others continue operating. Building reliable abstractions atop "
+    "unreliable hardware requires explicit reasoning about failure modes, network "
+    "partitions, and the consistency guarantees achievable under each scenario.",
+
+    "Inference efficiency for large language models is constrained by memory bandwidth "
+    "rather than compute in the memory-bound decode phase. Arithmetic intensity — the "
+    "ratio of floating-point operations to memory bytes accessed — is the key metric "
+    "distinguishing compute-bound from memory-bound workloads.",
+
+    "Compiler optimization passes operate on intermediate representations that abstract "
+    "away machine-specific details while preserving semantic equivalence. Transformations "
+    "such as loop unrolling, vectorization, and instruction scheduling must respect "
+    "data dependencies and maintain observable behavior at optimization boundaries.",
+
+    "Network protocols balance reliability, ordering, and efficiency across diverse "
+    "link characteristics. Congestion control algorithms must infer network state from "
+    "observable signals such as round-trip time variation and packet loss, adapting "
+    "transmission rates to maximize utilization without inducing persistent queuing.",
+
+    "Database query optimizers generate execution plans by estimating the cost of "
+    "alternative operator orderings, join strategies, and index access paths. Cardinality "
+    "estimation errors propagate through plan trees and can cause orders-of-magnitude "
+    "performance regressions in complex multi-table queries.",
+
+    "Hardware accelerators achieve efficiency by exploiting data parallelism, operation "
+    "fusion, and reduced-precision arithmetic. Programming models for heterogeneous "
+    "systems must expose enough structure for the compiler and runtime to map "
+    "computations onto specialized execution units without sacrificing generality.",
+]
+
+_CHARS_PER_TOKEN = 3.8  # conservative estimate for mixed technical/code text
 
 
-def make_prompt(target_tokens: int) -> str:
-    """Approximate a prompt with *target_tokens* tokens.
-    Uses rough heuristic: 1 token ≈ 0.75 words (for English prose).
+def _pad_to_chars(target_chars: int, start_idx: int) -> str:
+    """Repeat passages in rotation until we reach approximately target_chars."""
+    parts: list[str] = []
+    total = 0
+    i = start_idx
+    while total < target_chars:
+        p = _PASSAGES[i % len(_PASSAGES)]
+        parts.append(p)
+        total += len(p) + 1
+        i += 1
+    text = " ".join(parts)
+    return text[:target_chars]
+
+
+def make_prompt(target_input_tokens: int, target_output_tokens: int, request_idx: int) -> str:
     """
-    words_needed = max(1, int(target_tokens * 0.75))
-    repeats = (words_needed // len(_BASE_WORDS)) + 2
-    words = (_BASE_WORDS * repeats)[:words_needed]
-    return " ".join(words)
+    Build a prompt that:
+      1. Starts with a unique UUID so every request has a distinct KV prefix.
+      2. Contains enough context to fill target_input_tokens.
+      3. Asks for a thorough essay to encourage target_output_tokens of output.
+    """
+    uid = uuid.uuid4().hex[:20]          # unique per request — defeats prefix caching
+    topic = _TOPICS[request_idx % len(_TOPICS)]
+
+    if target_input_tokens <= 2048:
+        # Short-to-medium ISL: direct essay request, padded with context
+        instruction = (
+            f"[{uid}]\n\n"
+            f"Write a thorough technical essay on: {topic}\n\n"
+            f"Your essay must cover all of the following:\n"
+            f"  1. Motivation and the problem being solved\n"
+            f"  2. Theoretical foundations and core concepts\n"
+            f"  3. Key algorithms, data structures, and mechanisms\n"
+            f"  4. Implementation details and engineering trade-offs\n"
+            f"  5. Performance characteristics, bottlenecks, and optimization strategies\n"
+            f"  6. Comparison with alternative approaches\n"
+            f"  7. Real-world deployment experience and case studies\n"
+            f"  8. Current limitations and open research questions\n"
+            f"  9. Future directions and emerging work\n\n"
+            f"Background context:\n"
+        )
+        suffix = "\n\nEssay:\n"
+        reserved_chars = int((len(instruction) + len(suffix)) * 1.1)
+        padding_chars = max(0, int(target_input_tokens * _CHARS_PER_TOKEN) - reserved_chars)
+        return instruction + _pad_to_chars(padding_chars, request_idx) + suffix
+
+    else:
+        # Long ISL: document analysis format (~8k tokens)
+        header = f"[{uid}]\n\nReference Document:\n\n"
+        question = (
+            f"\n\nTask: Based on the reference document above, write a comprehensive "
+            f"technical analysis of {topic}. Cover design principles, algorithms, "
+            f"performance characteristics, implementation trade-offs, real-world "
+            f"applications, known limitations, and future research directions. "
+            f"Your analysis should be detailed and well-structured.\n\nAnalysis:\n"
+        )
+        reserved_chars = int((len(header) + len(question)) * 1.1)
+        doc_chars = max(0, int(target_input_tokens * _CHARS_PER_TOKEN) - reserved_chars)
+        return header + _pad_to_chars(doc_chars, request_idx) + question
 
 
 # ---------------------------------------------------------------------------
-# Request data classes
+# Saturation monitor
+# ---------------------------------------------------------------------------
+
+
+async def _monitor_saturation(
+    metrics_url: str,
+    stop_event: asyncio.Event,
+) -> dict:
+    """
+    Poll vLLM /metrics every 0.5s for vllm:num_requests_waiting.
+    Saturation is declared when waiting > 0 for 3+ consecutive polls (~1.5s),
+    which distinguishes sustained KV-cache pressure from transient startup bursts.
+    """
+    result: dict = {"max_waiting": 0.0, "saturated": False, "peak_consecutive": 0}
+    consecutive = 0
+
+    connector = aiohttp.TCPConnector()
+    async with aiohttp.ClientSession(connector=connector) as session:
+        while not stop_event.is_set():
+            try:
+                async with session.get(
+                    metrics_url, timeout=aiohttp.ClientTimeout(total=2)
+                ) as resp:
+                    text = await resp.text()
+                    waiting = 0.0
+                    for line in text.splitlines():
+                        if line.startswith("vllm:num_requests_waiting{"):
+                            try:
+                                waiting += float(line.split()[-1])
+                            except (ValueError, IndexError):
+                                pass
+
+                    result["max_waiting"] = max(result["max_waiting"], waiting)
+                    if waiting > 0:
+                        consecutive += 1
+                        result["peak_consecutive"] = max(
+                            result["peak_consecutive"], consecutive
+                        )
+                        if consecutive >= 3:
+                            result["saturated"] = True
+                    else:
+                        consecutive = 0
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(stop_event.wait()), timeout=0.5
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Single request
 # ---------------------------------------------------------------------------
 
 
@@ -66,11 +253,6 @@ class RequestResult:
     ttft_s: Optional[float]
     success: bool
     error: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# Single async request (streaming, extracts usage from final chunk)
-# ---------------------------------------------------------------------------
 
 
 async def send_request(
@@ -87,7 +269,7 @@ async def send_request(
         "max_tokens": max_tokens,
         "temperature": 0,
         "stream": True,
-        # include_usage causes vLLM to emit token counts in the final SSE chunk
+        # Instructs vLLM to include token counts in the final SSE chunk
         "stream_options": {"include_usage": True},
     }
     t_start = time.perf_counter()
@@ -113,7 +295,6 @@ async def send_request(
                     except json.JSONDecodeError:
                         continue
 
-                    # Usage appears in the last non-DONE chunk when stream_options used
                     usage = chunk.get("usage")
                     if usage:
                         output_tokens = usage.get("completion_tokens", 0)
@@ -157,59 +338,75 @@ def _percentile(data: list[float], p: int) -> float:
 async def measure_batch_size(
     base_url: str,
     model: str,
-    prompts: list[str],
-    max_tokens: int,
+    input_len: int,
+    output_len: int,
+    num_prompts: int,
     batch_size: int,
     num_warmup: int,
 ) -> dict:
-    """Send all prompts with at most batch_size concurrent requests.
-    Returns a dict of throughput and latency metrics.
     """
-    url = f"{base_url.rstrip('/')}/v1/completions"
+    Send num_prompts requests with at most batch_size concurrent, measure TPS.
+    Concurrently polls /metrics to detect KV cache saturation.
+    """
+    completions_url = f"{base_url.rstrip('/')}/v1/completions"
+    metrics_url = f"{base_url.rstrip('/')}/metrics"
     semaphore = asyncio.Semaphore(batch_size)
-    # Allow enough TCP connections for peak concurrency + a small buffer
     connector = aiohttp.TCPConnector(limit=batch_size + 16)
 
+    # Build prompts — each has a unique UUID prefix, topics rotate
+    prompts = [
+        make_prompt(input_len, output_len, i)
+        for i in range(max(num_prompts, num_warmup))
+    ]
+
     async with aiohttp.ClientSession(connector=connector) as session:
-        # --- Warmup (not timed) ---
+        # Warmup (not timed, no saturation check)
         if num_warmup > 0:
-            warmup_sem = asyncio.Semaphore(min(num_warmup, batch_size))
-            warmup_tasks = [
-                send_request(session, url, model, prompts[i % len(prompts)],
-                             max_tokens, warmup_sem)
+            wu_sem = asyncio.Semaphore(min(num_warmup, batch_size))
+            wu_tasks = [
+                send_request(session, completions_url, model, prompts[i], output_len, wu_sem)
                 for i in range(num_warmup)
             ]
-            await asyncio.gather(*warmup_tasks)
+            await asyncio.gather(*wu_tasks)
 
-        # --- Timed benchmark ---
+        # Start saturation monitor
+        stop_monitor = asyncio.Event()
+        monitor_task = asyncio.create_task(
+            _monitor_saturation(metrics_url, stop_monitor)
+        )
+
+        # Timed benchmark
         t_start = time.perf_counter()
         tasks = [
-            send_request(session, url, model, p, max_tokens, semaphore)
-            for p in prompts
+            send_request(
+                session, completions_url, model,
+                prompts[i % len(prompts)],
+                output_len, semaphore,
+            )
+            for i in range(num_prompts)
         ]
         results: list[RequestResult] = await asyncio.gather(*tasks)
         elapsed = time.perf_counter() - t_start
 
+        # Stop monitor and collect saturation data
+        stop_monitor.set()
+        saturation = await monitor_task
+
     good = [r for r in results if r.success]
     failed = len(results) - len(good)
-
     total_out = sum(r.output_tokens for r in good)
     total_in = sum(r.input_tokens for r in good)
-
     latencies = [r.latency_s for r in good]
     ttfts = [r.ttft_s for r in good if r.ttft_s is not None]
 
-    output_tps = total_out / elapsed if elapsed > 0 else 0.0
-    total_tps = (total_in + total_out) / elapsed if elapsed > 0 else 0.0
-
     return {
         "batch_size": batch_size,
-        "num_prompts": len(prompts),
+        "num_prompts": num_prompts,
         "num_successful": len(good),
         "num_failed": failed,
         "elapsed_s": round(elapsed, 3),
-        "output_tps": round(output_tps, 2),
-        "total_tps": round(total_tps, 2),
+        "output_tps": round(total_out / elapsed, 2) if elapsed > 0 else 0.0,
+        "total_tps": round((total_in + total_out) / elapsed, 2) if elapsed > 0 else 0.0,
         "request_tps": round(len(good) / elapsed, 3) if elapsed > 0 else 0.0,
         "latency_mean_s": round(sum(latencies) / len(latencies), 3) if latencies else 0.0,
         "latency_p50_s": round(_percentile(latencies, 50), 3),
@@ -218,6 +415,9 @@ async def measure_batch_size(
         "ttft_mean_s": round(sum(ttfts) / len(ttfts), 3) if ttfts else 0.0,
         "ttft_p50_s": round(_percentile(ttfts, 50), 3),
         "ttft_p99_s": round(_percentile(ttfts, 99), 3),
+        "max_requests_waiting": saturation["max_waiting"],
+        "kv_saturated": saturation["saturated"],
+        "peak_consecutive_waiting_polls": saturation["peak_consecutive"],
     }
 
 
@@ -227,10 +427,15 @@ async def measure_batch_size(
 
 
 def _print_table(results: list[dict]) -> None:
-    header = f"{'Batch':>6}  {'Out TPS':>9}  {'Tot TPS':>9}  {'Lat P50':>8}  {'Lat P99':>8}  {'TTFT P99':>9}  {'Failed':>6}"
+    header = (
+        f"{'Batch':>6}  {'Out TPS':>9}  {'Tot TPS':>9}  "
+        f"{'Lat P50':>8}  {'Lat P99':>8}  {'TTFT P99':>9}  "
+        f"{'MaxWait':>8}  {'Saturated':>9}  {'Failed':>6}"
+    )
     print("\n" + header)
     print("-" * len(header))
     for r in results:
+        sat = "YES" if r.get("kv_saturated") else "-"
         print(
             f"{r['batch_size']:>6}  "
             f"{r['output_tps']:>9.1f}  "
@@ -238,6 +443,8 @@ def _print_table(results: list[dict]) -> None:
             f"{r['latency_p50_s']:>8.2f}  "
             f"{r['latency_p99_s']:>8.2f}  "
             f"{r['ttft_p99_s']:>9.2f}  "
+            f"{r['max_requests_waiting']:>8.0f}  "
+            f"{sat:>9}  "
             f"{r['num_failed']:>6}"
         )
 
@@ -247,36 +454,45 @@ async def _run(args: argparse.Namespace) -> None:
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    prompt = make_prompt(args.input_len)
-    prompts = [prompt] * args.num_prompts
-
     all_results: list[dict] = []
 
     for bs in batch_sizes:
-        print(f"\n[batch_size={bs}]  sending {args.num_prompts} prompts "
-              f"(warmup={args.num_warmup}) ...", flush=True)
+        print(
+            f"\n[batch_size={bs}]  prompts={args.num_prompts}  "
+            f"ISL={args.input_len}  OSL={args.output_len}  "
+            f"warmup={args.num_warmup}",
+            flush=True,
+        )
         result = await measure_batch_size(
             base_url=args.base_url,
             model=args.model,
-            prompts=prompts,
-            max_tokens=args.output_len,
+            input_len=args.input_len,
+            output_len=args.output_len,
+            num_prompts=args.num_prompts,
             batch_size=bs,
             num_warmup=args.num_warmup,
         )
         all_results.append(result)
+
+        sat_str = "  *** KV SATURATED ***" if result["kv_saturated"] else ""
         print(
             f"  output_tps={result['output_tps']:.1f}  "
             f"total_tps={result['total_tps']:.1f}  "
             f"lat_p99={result['latency_p99_s']:.2f}s  "
             f"ttft_p99={result['ttft_p99_s']:.2f}s  "
+            f"max_waiting={result['max_requests_waiting']:.0f}  "
             f"failed={result['num_failed']}"
+            f"{sat_str}"
         )
 
-        out_file = results_dir / f"bs{bs:04d}.json"
+        out_file = results_dir / f"bs{bs:06d}.json"
         with open(out_file, "w") as f:
             json.dump(result, f, indent=2)
 
-    # Combined summary
+        if result["kv_saturated"]:
+            print(f"\nKV cache saturated — stopping sweep at batch_size={bs}.")
+            break
+
     summary = {
         "model": args.model,
         "base_url": args.base_url,
@@ -297,20 +513,19 @@ def main() -> None:
         description="TPS sweep: vary concurrency without restarting vLLM"
     )
     parser.add_argument("--model", required=True,
-                        help="Model name as registered in vLLM (--served-model-name)")
+                        help="--served-model-name value used when launching vLLM")
     parser.add_argument("--base-url", default="http://localhost:8000")
-    parser.add_argument("--batch-sizes", default="1,2,4,8,16,32,64,128",
+    parser.add_argument("--batch-sizes", default="1,2,4,8,16,32,64,128,256,512,1024,2048,4096",
                         help="Comma-separated concurrency levels to sweep")
-    parser.add_argument("--input-len", type=int, default=512,
-                        help="Approximate prompt length in tokens")
-    parser.add_argument("--output-len", type=int, default=512,
-                        help="max_tokens per request")
+    parser.add_argument("--input-len", type=int, default=1024,
+                        help="Target prompt length in tokens (ISL)")
+    parser.add_argument("--output-len", type=int, default=1024,
+                        help="max_tokens per request (OSL cap)")
     parser.add_argument("--num-prompts", type=int, default=200,
                         help="Requests per batch-size point")
     parser.add_argument("--num-warmup", type=int, default=20,
                         help="Warmup requests before timing (not counted)")
-    parser.add_argument("--results-dir", default="results",
-                        help="Directory to write per-batch-size JSON files")
+    parser.add_argument("--results-dir", default="results")
     args = parser.parse_args()
     asyncio.run(_run(args))
 
