@@ -1,0 +1,23 @@
+# Per-model virtual environments (created by models/*/setup.sh)
+models/*/venv/
+
+# Downloaded model weights — can be hundreds of GB
+models/*/model/
+
+# Benchmark client venv (created by setup.sh)
+bench/venv/
+
+# Cloned InferenceX repo (fetched by setup.sh)
+InferenceX/
+
+# Benchmark results (keep the placeholder, ignore actual output)
+results/*
+!results/.gitkeep
+
+# cuda-checkpoint binary (obtained separately)
+cuda-checkpoint
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
