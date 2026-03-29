@@ -72,8 +72,17 @@ stop_sat_poller() {
 }
 
 # ── Sweep ─────────────────────────────────────────────────────────────
+MIN_PROMPTS="${MIN_PROMPTS:-50}"
+MAX_PROMPTS="${MAX_PROMPTS:-1000}"
+
 for BS in "${BATCH_SIZES[@]}"; do
-    echo "--- batch_size=$BS ---"
+    # Scale prompts with batch size: at least 2 full batches, clamped to
+    # [MIN_PROMPTS, MAX_PROMPTS].  Small BS gets fewer prompts (faster),
+    # large BS gets more (better statistics where variance is higher).
+    SCALED=$((BS * 2))
+    SCALED=$(( SCALED < MIN_PROMPTS ? MIN_PROMPTS : SCALED ))
+    SCALED=$(( SCALED > MAX_PROMPTS ? MAX_PROMPTS : SCALED ))
+    echo "--- batch_size=$BS  prompts=$SCALED ---"
 
     SAT_FILE=$(mktemp)
     POLLER_PID=$(start_sat_poller "$SAT_FILE")
@@ -88,7 +97,7 @@ for BS in "${BATCH_SIZES[@]}"; do
             --random-output-len "$OUTPUT_LEN" \
             --random-prefix-len 0 \
             --max-concurrency "$BS" \
-            --num-prompts "$NUM_PROMPTS" \
+            --num-prompts "$SCALED" \
             --num-warmups "$NUM_WARMUP" \
             --save-result "$RESULTS_DIR/bs$(printf '%04d' "$BS").json" \
             --percentile-metrics ttft,tpot,itl,e2el \
@@ -100,7 +109,7 @@ for BS in "${BATCH_SIZES[@]}"; do
             --batch-sizes "$BS" \
             --input-len "$INPUT_LEN" \
             --output-len "$OUTPUT_LEN" \
-            --num-prompts "$NUM_PROMPTS" \
+            --num-prompts "$SCALED" \
             --num-warmup "$NUM_WARMUP" \
             --results-dir "$RESULTS_DIR"
     fi

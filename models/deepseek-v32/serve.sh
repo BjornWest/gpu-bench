@@ -32,13 +32,12 @@ vllm serve \
     --enable-auto-tool-choice \
     --tool-call-parser deepseek_v31 \
     --reasoning-parser deepseek_v3 \
-    --swap-space 16 \
-    --max-num-seqs 32 \
+    --max-num-seqs 1024 \
     --max-model-len $CONTEXT_LENGTH \
     --gpu-memory-utilization 0.9 \
     --tensor-parallel-size 8 \
-    --enable-expert-parallel \  # optional
-    --speculative-config "$SPEC_CONFIG" \  # optional, 50%+- throughput increase is observed
+    --enable-expert-parallel \
+    --speculative-config "$SPEC_CONFIG" \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000 \

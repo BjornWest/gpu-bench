@@ -8,7 +8,7 @@ MODEL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 uv venv "$MODEL_DIR/venv"
 source "$MODEL_DIR/venv/bin/activate"
 
-pip install vllm==0.17.1
+uv pip install vllm==0.17.1
 uv pip install hf-transfer huggingface_hub
 
 curl -O https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8/raw/main/super_v3_reasoning_parser.py

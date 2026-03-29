@@ -26,7 +26,7 @@ vllm serve "$MODEL_DIR/model" \
   --async-scheduling \
   --dtype auto \
   --kv-cache-dtype fp8 \
-  --tensor-parallel-size 4 \
+  --tensor-parallel-size 8 \
   --max-model-len 262144 \
   --enable-expert-parallel \
   --swap-space 0 \
