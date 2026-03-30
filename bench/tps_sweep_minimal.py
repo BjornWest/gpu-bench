@@ -231,11 +231,10 @@ async def _monitor_saturation(
                 pass
 
             try:
-                await asyncio.wait_for(
-                    asyncio.shield(stop_event.wait()), timeout=0.5
-                )
+                await asyncio.wait_for(stop_event.wait(), timeout=0.5)
+                break  # stop_event was set — exit loop
             except asyncio.TimeoutError:
-                pass
+                pass  # normal: poll again
 
     return result
 
