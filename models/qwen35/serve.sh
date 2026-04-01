@@ -29,5 +29,6 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8
     --max-model-len 262144 \
     --reasoning-parser qwen3 \
     --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}' \
+    --enable-prompt-tokens-details \
     --enable-sleep-mode
 

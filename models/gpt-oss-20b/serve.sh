@@ -21,14 +21,14 @@ export TIKTOKEN_RS_CACHE_DIR="/home/bjowes/code/models/encodings/"
 export VLLM_SERVER_DEV_MODE=1
 
 uv run python -m vllm.entrypoints.openai.api_server \
-    --model "$MODEL_PATH" \
-    --served-model-name gpt-oss-20b \
-    --gpu-memory-utilization 0.85 \
-    --max-num-seqs 50 \
-    --trust-remote-code \
-    --tool-call-parser openai \
-    --enable-auto-tool-choice \
-    --reasoning-parser openai_gptoss \
-    --enable-sleep-mode \
-    --host 0.0.0.0 \
-    --port 8000
+  --max-model-len 40480 \
+  --model /home/bjowes/code/models/gpt-oss-20b \
+  --gpu-memory-utilization 0.85 \
+  --max-num-seqs 600 \
+  --served-model-name gpt-oss-20b \
+  --trust-remote-code \
+  --tool-call-parser openai \
+  --enable-auto-tool-choice \
+  --reasoning-parser openai_gptoss \
+  --enable-prompt-tokens-details \
+  --enable-sleep-mode \

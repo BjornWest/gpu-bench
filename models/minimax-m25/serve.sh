@@ -35,3 +35,4 @@ exec vllm serve "$MODEL_DIR/model" \
     --enable-auto-tool-choice \
     --tool-call-parser minimax_m2 \
     --reasoning-parser minimax_m2_append_think \
+    --enable-prompt-tokens-details

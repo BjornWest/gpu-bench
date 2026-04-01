@@ -39,4 +39,5 @@ exec vllm serve \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000 \
+    --enable-prompt-tokens-details \
     --enable-sleep-mode

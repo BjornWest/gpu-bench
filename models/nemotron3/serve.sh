@@ -38,4 +38,5 @@ vllm serve "$MODEL_DIR/model" \
   --reasoning-parser nemotron_v3 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
+  --enable-prompt-tokens-details \
   --enable-sleep-mode

@@ -25,5 +25,6 @@ exec vllm serve "$MODEL_DIR/model" \
     --max-num-seqs 512 \
     --port 8000 \
     --served-model-name devstral2 \
+    --enable-prompt-tokens-details \
     --enable-sleep-mode \
     --disable-log-requests
