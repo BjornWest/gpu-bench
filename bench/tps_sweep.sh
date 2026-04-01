@@ -1,129 +1,94 @@
 #!/usr/bin/env bash
 # Sweep batch sizes for a running vLLM server.
-# No restart between batch sizes — concurrency controlled by --max-concurrency.
-# Stops early when the server's KV cache fills (requests start waiting).
+# Runs two test modes:
+#   1. Decode — shared prefix, sweep batch sizes (isolates decode throughput)
+#   2. Prefill — unique prompts, sweep input lengths × batch sizes (isolates prefill)
 #
-# Usage:  bash bench/tps_sweep.sh <model_name> [results_dir]
+# No restart between tests — concurrency controlled by --max-concurrency.
+# Stops early when the server's KV cache fills.
+#
+# Usage:  bash bench/tps_sweep.sh [--decode|--prefill] <model_name> [results_dir]
 # Requires: server already running and healthy on $HOST:$PORT
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-source "$ROOT_DIR/models.conf"
+source "$ROOT_DIR/sweep.conf"
 
-MODEL_NAME="${1:?Usage: tps_sweep.sh <model_name> [results_dir]}"
+# ── Parse flags ──────────────────────────────────────────────────────
+RUN_DECODE=0
+RUN_PREFILL=0
+while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+        --decode)  RUN_DECODE=1; shift ;;
+        --prefill) RUN_PREFILL=1; shift ;;
+        *) echo "Unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Default: run both
+if [[ $RUN_DECODE -eq 0 && $RUN_PREFILL -eq 0 ]]; then
+    RUN_DECODE=1
+    RUN_PREFILL=1
+fi
+
+MODEL_NAME="${1:?Usage: tps_sweep.sh [--decode|--prefill] <model_name> [results_dir]}"
 RESULTS_DIR="${2:-$ROOT_DIR/results/$MODEL_NAME}"
 
-BENCH_SCRIPT="$ROOT_DIR/InferenceX/utils/bench_serving/benchmark_serving.py"
 MINIMAL_SCRIPT="$SCRIPT_DIR/tps_sweep_minimal.py"
 BENCH_VENV="$SCRIPT_DIR/venv"
 
+# Use the bench venv if it exists, otherwise fall back to uv run.
 if [ -d "$BENCH_VENV" ]; then
     source "$BENCH_VENV/bin/activate"
+    PY="python"
+else
+    PY="uv run"
 fi
 
 mkdir -p "$RESULTS_DIR"
 
-if [ -f "$BENCH_SCRIPT" ]; then
-    USE_INFERENCEX=1
-    echo "Using InferenceX benchmark_serving.py"
-else
-    USE_INFERENCEX=0
-    echo "InferenceX not found — using tps_sweep_minimal.py (run setup.sh to get InferenceX)"
+# ── Decode test ──────────────────────────────────────────────────────
+if [[ $RUN_DECODE -eq 1 ]]; then
+    echo ""
+    echo "=========================================="
+    echo "  DECODE TEST — $MODEL_NAME"
+    echo "  Shared prefix, sweep batch sizes"
+    echo "  ISL: ${DECODE_INPUT_LEN}  OSL: ${DECODE_OUTPUT_LEN}"
+    echo "  Batch sizes: ${DECODE_BATCH_SIZES[*]}"
+    echo "=========================================="
+
+    $PY "$MINIMAL_SCRIPT" decode \
+        --model "$MODEL_NAME" \
+        --base-url "http://${HOST}:${PORT}" \
+        --batch-sizes "$(IFS=,; echo "${DECODE_BATCH_SIZES[*]}")" \
+        --input-len "$DECODE_INPUT_LEN" \
+        --output-len "$DECODE_OUTPUT_LEN" \
+        --num-prompts "$NUM_PROMPTS" \
+        --num-warmup "$NUM_WARMUP" \
+        --results-dir "$RESULTS_DIR/decode"
 fi
 
-echo "Model: $MODEL_NAME  batch sizes: ${BATCH_SIZES[*]}"
-echo "ISL: ${INPUT_LEN} tokens  OSL: ${OUTPUT_LEN} tokens  Prompts: ${NUM_PROMPTS}"
-echo "Results: $RESULTS_DIR"
-echo ""
-
-# ── Saturation polling ────────────────────────────────────────────────
-# Polls /metrics every 0.5s in a background subshell.
-# Writes "1" to SAT_FILE when num_requests_waiting > 0 for 3+ consecutive polls.
-start_sat_poller() {
-    local sat_file="$1"
-    (
-        CONSEC=0
-        while true; do
-            RAW=$(curl -sf "http://${HOST}:${PORT}/metrics" 2>/dev/null || true)
-            # Sum all num_requests_waiting gauge values (one per model name label)
-            WAITING=$(echo "$RAW" | awk '
-                /^vllm:num_requests_waiting\{/ { s += $NF }
-                END { print (s > 0) ? 1 : 0 }
-            ')
-            if [ "${WAITING:-0}" -eq 1 ]; then
-                CONSEC=$((CONSEC + 1))
-                if [ $CONSEC -ge 3 ]; then
-                    echo "1" > "$sat_file"
-                fi
-            else
-                CONSEC=0
-            fi
-            sleep 0.5
-        done
-    ) &
-    echo $!  # return poller PID
-}
-
-stop_sat_poller() {
-    local pid="$1"
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-}
-
-# ── Sweep ─────────────────────────────────────────────────────────────
-MIN_PROMPTS="${MIN_PROMPTS:-50}"
-MAX_PROMPTS="${MAX_PROMPTS:-1000}"
-
-for BS in "${BATCH_SIZES[@]}"; do
-    # Scale prompts with batch size: at least 2 full batches, clamped to
-    # [MIN_PROMPTS, MAX_PROMPTS].  Small BS gets fewer prompts (faster),
-    # large BS gets more (better statistics where variance is higher).
-    SCALED=$((BS * 2))
-    SCALED=$(( SCALED < MIN_PROMPTS ? MIN_PROMPTS : SCALED ))
-    SCALED=$(( SCALED > MAX_PROMPTS ? MAX_PROMPTS : SCALED ))
-    echo "--- batch_size=$BS  prompts=$SCALED ---"
-
-    SAT_FILE=$(mktemp)
-    POLLER_PID=$(start_sat_poller "$SAT_FILE")
-
-    if [ "$USE_INFERENCEX" -eq 1 ]; then
-        python "$BENCH_SCRIPT" \
-            --backend vllm \
-            --base-url "http://${HOST}:${PORT}" \
-            --model "$MODEL_NAME" \
-            --dataset-name random \
-            --random-input-len "$INPUT_LEN" \
-            --random-output-len "$OUTPUT_LEN" \
-            --random-prefix-len 0 \
-            --max-concurrency "$BS" \
-            --num-prompts "$SCALED" \
-            --num-warmups "$NUM_WARMUP" \
-            --save-result "$RESULTS_DIR/bs$(printf '%04d' "$BS").json" \
-            --percentile-metrics ttft,tpot,itl,e2el \
-            --request-rate inf
-    else
-        python "$MINIMAL_SCRIPT" \
-            --model "$MODEL_NAME" \
-            --base-url "http://${HOST}:${PORT}" \
-            --batch-sizes "$BS" \
-            --input-len "$INPUT_LEN" \
-            --output-len "$OUTPUT_LEN" \
-            --num-prompts "$SCALED" \
-            --num-warmup "$NUM_WARMUP" \
-            --results-dir "$RESULTS_DIR"
-    fi
-
-    stop_sat_poller "$POLLER_PID"
-
-    if [ "$(cat "$SAT_FILE" 2>/dev/null)" = "1" ]; then
-        rm -f "$SAT_FILE"
-        echo ""
-        echo "KV cache saturated at batch_size=$BS — stopping sweep."
-        break
-    fi
-    rm -f "$SAT_FILE"
+# ── Prefill test ─────────────────────────────────────────────────────
+if [[ $RUN_PREFILL -eq 1 ]]; then
     echo ""
-done
+    echo "=========================================="
+    echo "  PREFILL TEST — $MODEL_NAME"
+    echo "  Unique prompts, sweep input lengths"
+    echo "  ISLs: ${PREFILL_INPUT_LENS[*]}  OSL: ${PREFILL_OUTPUT_LEN}"
+    echo "  Batch sizes: ${PREFILL_BATCH_SIZES[*]}"
+    echo "=========================================="
 
+    $PY "$MINIMAL_SCRIPT" prefill \
+        --model "$MODEL_NAME" \
+        --base-url "http://${HOST}:${PORT}" \
+        --input-lens "$(IFS=,; echo "${PREFILL_INPUT_LENS[*]}")" \
+        --batch-sizes "$(IFS=,; echo "${PREFILL_BATCH_SIZES[*]}")" \
+        --output-len "$PREFILL_OUTPUT_LEN" \
+        --num-prompts "$NUM_PROMPTS" \
+        --num-warmup "$NUM_WARMUP" \
+        --results-dir "$RESULTS_DIR/prefill"
+fi
+
+echo ""
 echo "Sweep complete: $RESULTS_DIR"

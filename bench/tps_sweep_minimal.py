@@ -2,31 +2,48 @@
 """
 Standalone TPS sweep benchmark for vLLM (OpenAI-compatible completions API).
 
+Two test modes:
+
+  decode  — Isolate decode throughput. All requests share the same prompt so
+            prefix caching makes prefill essentially free after the first hit.
+            Sweeps batch sizes.
+
+  prefill — Isolate prefill throughput. Each request has a unique prompt (no
+            caching), output is capped at a few tokens. Sweeps input lengths
+            and optionally batch sizes.
+
 Key design choices:
   - No server restarts: batch size is controlled via asyncio.Semaphore on the
     client; the server must be started with --max-num-seqs >= max(BATCH_SIZES).
-  - Unique per-request prompts: every prompt starts with a UUID hex prefix, so
-    prefix caching gives zero benefit across requests (no shared KV blocks).
-  - Long-answer prompts: prompts are structured to elicit ~OUTPUT_LEN tokens.
   - Saturation detection: polls /metrics for vllm:num_requests_waiting; stops
     the sweep when the KV cache fills (3+ consecutive non-zero readings).
 
 Usage:
+  # Decode sweep (batch sizes)
+  python tps_sweep_minimal.py decode \\
+    --model qwen35 --base-url http://localhost:8000 \\
+    --batch-sizes 1,64,128,256,512 \\
+    --input-len 512 --output-len 1024 \\
+    --results-dir ../results/qwen35/decode
+
+  # Prefill sweep (input lengths × batch sizes)
+  python tps_sweep_minimal.py prefill \\
+    --model qwen35 --base-url http://localhost:8000 \\
+    --input-lens 4096,16384,32768,65536 \\
+    --batch-sizes 1,16,64 \\
+    --output-len 8 \\
+    --results-dir ../results/qwen35/prefill
+
+  # Legacy (no subcommand) — behaves like old combined test
   python tps_sweep_minimal.py \\
-    --model qwen35 \\
-    --base-url http://localhost:8000 \\
-    --batch-sizes 1,2,4,8,16,32,64,128,256,512,1024,2048,4096 \\
-    --input-len 1024 \\
-    --output-len 1024 \\
-    --num-prompts 200 \\
-    --num-warmup 20 \\
-    --results-dir ../results/qwen35
+    --model qwen35 ...
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -134,14 +151,27 @@ def _pad_to_chars(target_chars: int, start_idx: int) -> str:
     return text[:target_chars]
 
 
-def make_prompt(target_input_tokens: int, target_output_tokens: int, request_idx: int) -> str:
+def make_prompt(
+    target_input_tokens: int,
+    target_output_tokens: int,
+    request_idx: int,
+    *,
+    shared_prefix: bool = False,
+) -> str:
     """
     Build a prompt that:
-      1. Starts with a unique UUID so every request has a distinct KV prefix.
+      1. Starts with a UUID prefix (unique per request, or shared for cache testing).
       2. Contains enough context to fill target_input_tokens.
       3. Asks for a thorough essay to encourage target_output_tokens of output.
+
+    When shared_prefix=True, all requests use the same prefix so prefix caching
+    makes prefill essentially free after the first request. Used for decode tests.
     """
-    uid = uuid.uuid4().hex[:20]          # unique per request — defeats prefix caching
+    if shared_prefix:
+        uid = "shared-bench-prefix-00"    # identical across requests — enables prefix caching
+        request_idx = 0                   # same topic + padding for all — fully shared prompt
+    else:
+        uid = uuid.uuid4().hex[:20]       # unique per request — defeats prefix caching
     topic = _TOPICS[request_idx % len(_TOPICS)]
 
     if target_input_tokens <= 2048:
@@ -186,16 +216,25 @@ def make_prompt(target_input_tokens: int, target_output_tokens: int, request_idx
 # ---------------------------------------------------------------------------
 
 
+KV_CACHE_SATURATION_THRESHOLD = 0.95
+
+
 async def _monitor_saturation(
     metrics_url: str,
     stop_event: asyncio.Event,
 ) -> dict:
     """
-    Poll vLLM /metrics every 0.5s for vllm:num_requests_waiting.
-    Saturation is declared when waiting > 0 for 3+ consecutive polls (~1.5s),
-    which distinguishes sustained KV-cache pressure from transient startup bursts.
+    Poll vLLM /metrics every 0.5s for gpu_cache_usage_perc.
+    Saturation is declared when KV cache usage exceeds the threshold for
+    3+ consecutive polls (~1.5s), indicating the cache is genuinely full
+    (not just transient request queuing).
     """
-    result: dict = {"max_waiting": 0.0, "saturated": False, "peak_consecutive": 0}
+    result: dict = {
+        "max_kv_cache_pct": 0.0,
+        "max_waiting": 0.0,
+        "saturated": False,
+        "peak_consecutive": 0,
+    }
     consecutive = 0
 
     connector = aiohttp.TCPConnector()
@@ -206,16 +245,24 @@ async def _monitor_saturation(
                     metrics_url, timeout=aiohttp.ClientTimeout(total=2)
                 ) as resp:
                     text = await resp.text()
+                    kv_pct = 0.0
                     waiting = 0.0
                     for line in text.splitlines():
-                        if line.startswith("vllm:num_requests_waiting{"):
+                        if line.startswith("vllm:gpu_cache_usage_perc"):
+                            try:
+                                kv_pct = max(kv_pct, float(line.split()[-1]))
+                            except (ValueError, IndexError):
+                                pass
+                        elif line.startswith("vllm:num_requests_waiting{"):
                             try:
                                 waiting += float(line.split()[-1])
                             except (ValueError, IndexError):
                                 pass
 
+                    result["max_kv_cache_pct"] = max(result["max_kv_cache_pct"], kv_pct)
                     result["max_waiting"] = max(result["max_waiting"], waiting)
-                    if waiting > 0:
+
+                    if kv_pct >= KV_CACHE_SATURATION_THRESHOLD:
                         consecutive += 1
                         result["peak_consecutive"] = max(
                             result["peak_consecutive"], consecutive
@@ -252,6 +299,7 @@ class RequestResult:
     ttft_s: Optional[float]
     success: bool
     error: Optional[str] = None
+    output_hash: Optional[str] = None
 
 
 async def send_request(
@@ -261,12 +309,14 @@ async def send_request(
     prompt: str,
     max_tokens: int,
     semaphore: asyncio.Semaphore,
+    *,
+    greedy: bool = False,
 ) -> RequestResult:
     payload = {
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
-        "temperature": 0,
+        "temperature": 0 if greedy else 0.6,
         "stream": True,
         # Instructs vLLM to include token counts in the final SSE chunk
         "stream_options": {"include_usage": True},
@@ -342,19 +392,27 @@ async def measure_batch_size(
     num_prompts: int,
     batch_size: int,
     num_warmup: int,
+    *,
+    shared_prefix: bool = False,
+    greedy: bool = False,
+    test_mode: str = "combined",
 ) -> dict:
     """
     Send num_prompts requests with at most batch_size concurrent, measure TPS.
     Concurrently polls /metrics to detect KV cache saturation.
+
+    shared_prefix: if True, all prompts share the same prefix (for decode tests).
+    greedy: if True, use temperature=0 (identical outputs, maximizes KV sharing).
+    test_mode: label stored in results ("decode", "prefill", or "combined").
     """
     completions_url = f"{base_url.rstrip('/')}/v1/completions"
     metrics_url = f"{base_url.rstrip('/')}/metrics"
     semaphore = asyncio.Semaphore(batch_size)
     connector = aiohttp.TCPConnector(limit=batch_size + 16)
 
-    # Build prompts — each has a unique UUID prefix, topics rotate
+    # Build prompts
     prompts = [
-        make_prompt(input_len, output_len, i)
+        make_prompt(input_len, output_len, i, shared_prefix=shared_prefix)
         for i in range(max(num_prompts, num_warmup))
     ]
 
@@ -363,7 +421,7 @@ async def measure_batch_size(
         if num_warmup > 0:
             wu_sem = asyncio.Semaphore(min(num_warmup, batch_size))
             wu_tasks = [
-                send_request(session, completions_url, model, prompts[i], output_len, wu_sem)
+                send_request(session, completions_url, model, prompts[i], output_len, wu_sem, greedy=greedy)
                 for i in range(num_warmup)
             ]
             await asyncio.gather(*wu_tasks)
@@ -381,6 +439,7 @@ async def measure_batch_size(
                 session, completions_url, model,
                 prompts[i % len(prompts)],
                 output_len, semaphore,
+                greedy=greedy,
             )
             for i in range(num_prompts)
         ]
@@ -399,7 +458,10 @@ async def measure_batch_size(
     ttfts = [r.ttft_s for r in good if r.ttft_s is not None]
 
     return {
+        "test_mode": test_mode,
         "batch_size": batch_size,
+        "input_len": input_len,
+        "output_len": output_len,
         "num_prompts": num_prompts,
         "num_successful": len(good),
         "num_failed": failed,
@@ -414,9 +476,10 @@ async def measure_batch_size(
         "ttft_mean_s": round(sum(ttfts) / len(ttfts), 3) if ttfts else 0.0,
         "ttft_p50_s": round(_percentile(ttfts, 50), 3),
         "ttft_p99_s": round(_percentile(ttfts, 99), 3),
+        "max_kv_cache_pct": saturation["max_kv_cache_pct"],
         "max_requests_waiting": saturation["max_waiting"],
         "kv_saturated": saturation["saturated"],
-        "peak_consecutive_waiting_polls": saturation["peak_consecutive"],
+        "peak_consecutive_saturation_polls": saturation["peak_consecutive"],
     }
 
 
@@ -425,30 +488,81 @@ async def measure_batch_size(
 # ---------------------------------------------------------------------------
 
 
+MIN_PROMPTS = 20
+MAX_PROMPTS = 1000
+
+
+def _scale_prompts(base: int, batch_size: int) -> int:
+    """Scale request count with batch size.
+
+    At batch_size=1, sequential requests are slow — use fewer.
+    At large batch sizes, need enough requests to fill the batch and
+    get stable measurements.
+    Ensures at least 2× the batch size so the pipeline stays full.
+    """
+    scaled = max(MIN_PROMPTS, min(batch_size * 3, base, MAX_PROMPTS))
+    return max(scaled, batch_size * 2)
+
+
 def _print_table(results: list[dict]) -> None:
     header = (
-        f"{'Batch':>6}  {'Out TPS':>9}  {'Tot TPS':>9}  "
+        f"{'Batch':>6}  {'ISL':>6}  {'OSL':>6}  {'N':>5}  {'Out TPS':>9}  {'Tot TPS':>9}  "
         f"{'Lat P50':>8}  {'Lat P99':>8}  {'TTFT P99':>9}  "
-        f"{'MaxWait':>8}  {'Saturated':>9}  {'Failed':>6}"
+        f"{'KV%':>5}  {'Sat':>4}  {'Fail':>5}"
     )
     print("\n" + header)
     print("-" * len(header))
     for r in results:
         sat = "YES" if r.get("kv_saturated") else "-"
+        kv_pct = r.get("max_kv_cache_pct", 0) * 100
         print(
             f"{r['batch_size']:>6}  "
+            f"{r.get('input_len', '?'):>6}  "
+            f"{r.get('output_len', '?'):>6}  "
+            f"{r['num_prompts']:>5}  "
             f"{r['output_tps']:>9.1f}  "
             f"{r['total_tps']:>9.1f}  "
             f"{r['latency_p50_s']:>8.2f}  "
             f"{r['latency_p99_s']:>8.2f}  "
             f"{r['ttft_p99_s']:>9.2f}  "
-            f"{r['max_requests_waiting']:>8.0f}  "
-            f"{sat:>9}  "
-            f"{r['num_failed']:>6}"
+            f"{kv_pct:>5.1f}  "
+            f"{sat:>4}  "
+            f"{r['num_failed']:>5}"
         )
 
 
-async def _run(args: argparse.Namespace) -> None:
+def _log_result(result: dict) -> None:
+    sat_str = "  *** KV SATURATED ***" if result["kv_saturated"] else ""
+    print(
+        f"  output_tps={result['output_tps']:.1f}  "
+        f"total_tps={result['total_tps']:.1f}  "
+        f"lat_p99={result['latency_p99_s']:.2f}s  "
+        f"ttft_p99={result['ttft_p99_s']:.2f}s  "
+        f"max_waiting={result['max_requests_waiting']:.0f}  "
+        f"failed={result['num_failed']}"
+        f"{sat_str}"
+    )
+
+
+def _save_summary(results_dir: Path, args: argparse.Namespace,
+                   all_results: list[dict], test_mode: str) -> None:
+    summary = {
+        "model": args.model,
+        "base_url": args.base_url,
+        "test_mode": test_mode,
+        "num_prompts": args.num_prompts,
+        "results": all_results,
+    }
+    with open(results_dir / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    _print_table(all_results)
+    print(f"\nResults saved to {results_dir}/")
+
+
+# ── Decode sweep ──────────────────────────────────────────────────────
+
+async def _run_decode(args: argparse.Namespace) -> None:
+    """Sweep batch sizes with shared prefix (isolate decode throughput)."""
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -456,8 +570,99 @@ async def _run(args: argparse.Namespace) -> None:
     all_results: list[dict] = []
 
     for bs in batch_sizes:
+        n_prompts = _scale_prompts(args.num_prompts, bs)
         print(
-            f"\n[batch_size={bs}]  prompts={args.num_prompts}  "
+            f"\n[decode] batch_size={bs}  ISL={args.input_len}  OSL={args.output_len}  "
+            f"prompts={n_prompts}  warmup={args.num_warmup}",
+            flush=True,
+        )
+        result = await measure_batch_size(
+            base_url=args.base_url,
+            model=args.model,
+            input_len=args.input_len,
+            output_len=args.output_len,
+            num_prompts=n_prompts,
+            batch_size=bs,
+            num_warmup=args.num_warmup,
+            shared_prefix=True,
+            greedy=True,
+            test_mode="decode",
+        )
+        all_results.append(result)
+        _log_result(result)
+
+        out_file = results_dir / f"decode_bs{bs:06d}.json"
+        with open(out_file, "w") as f:
+            json.dump(result, f, indent=2)
+
+        if result["kv_saturated"]:
+            print(f"\nKV cache saturated — stopping sweep at batch_size={bs}.")
+            break
+
+    _save_summary(results_dir, args, all_results, "decode")
+
+
+# ── Prefill sweep ─────────────────────────────────────────────────────
+
+async def _run_prefill(args: argparse.Namespace) -> None:
+    """Sweep input lengths (and optionally batch sizes) with unique prompts."""
+    input_lens = [int(x) for x in args.input_lens.split(",")]
+    batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    all_results: list[dict] = []
+
+    for isl in input_lens:
+        for bs in batch_sizes:
+            n_prompts = _scale_prompts(args.num_prompts, bs)
+            print(
+                f"\n[prefill] ISL={isl}  batch_size={bs}  OSL={args.output_len}  "
+                f"prompts={n_prompts}  warmup={args.num_warmup}",
+                flush=True,
+            )
+            result = await measure_batch_size(
+                base_url=args.base_url,
+                model=args.model,
+                input_len=isl,
+                output_len=args.output_len,
+                num_prompts=n_prompts,
+                batch_size=bs,
+                num_warmup=args.num_warmup,
+                shared_prefix=False,
+                test_mode="prefill",
+            )
+            all_results.append(result)
+            _log_result(result)
+
+            out_file = results_dir / f"prefill_isl{isl:06d}_bs{bs:06d}.json"
+            with open(out_file, "w") as f:
+                json.dump(result, f, indent=2)
+
+            if result["kv_saturated"]:
+                print(f"\nKV cache saturated — stopping at ISL={isl} batch_size={bs}.")
+                break
+        else:
+            continue
+        break  # also break outer loop on saturation
+
+    _save_summary(results_dir, args, all_results, "prefill")
+
+
+# ── Legacy (combined) ─────────────────────────────────────────────────
+
+async def _run_combined(args: argparse.Namespace) -> None:
+    """Original sweep: unique prompts, batch size sweep (no mode isolation)."""
+    batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    all_results: list[dict] = []
+
+    for bs in batch_sizes:
+        n_prompts = _scale_prompts(args.num_prompts, bs)
+        print(
+            f"\n[batch_size={bs}]  prompts={n_prompts}  "
             f"ISL={args.input_len}  OSL={args.output_len}  "
             f"warmup={args.num_warmup}",
             flush=True,
@@ -467,22 +672,12 @@ async def _run(args: argparse.Namespace) -> None:
             model=args.model,
             input_len=args.input_len,
             output_len=args.output_len,
-            num_prompts=args.num_prompts,
+            num_prompts=n_prompts,
             batch_size=bs,
             num_warmup=args.num_warmup,
         )
         all_results.append(result)
-
-        sat_str = "  *** KV SATURATED ***" if result["kv_saturated"] else ""
-        print(
-            f"  output_tps={result['output_tps']:.1f}  "
-            f"total_tps={result['total_tps']:.1f}  "
-            f"lat_p99={result['latency_p99_s']:.2f}s  "
-            f"ttft_p99={result['ttft_p99_s']:.2f}s  "
-            f"max_waiting={result['max_requests_waiting']:.0f}  "
-            f"failed={result['num_failed']}"
-            f"{sat_str}"
-        )
+        _log_result(result)
 
         out_file = results_dir / f"bs{bs:06d}.json"
         with open(out_file, "w") as f:
@@ -492,41 +687,69 @@ async def _run(args: argparse.Namespace) -> None:
             print(f"\nKV cache saturated — stopping sweep at batch_size={bs}.")
             break
 
-    summary = {
-        "model": args.model,
-        "base_url": args.base_url,
-        "input_len": args.input_len,
-        "output_len": args.output_len,
-        "num_prompts": args.num_prompts,
-        "results": all_results,
-    }
-    with open(results_dir / "summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
+    _save_summary(results_dir, args, all_results, "combined")
 
-    _print_table(all_results)
-    print(f"\nResults saved to {results_dir}/")
+
+# ── CLI ───────────────────────────────────────────────────────────────
+
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model", required=True,
+                        help="--served-model-name value used when launching vLLM")
+    parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument("--num-prompts", type=int, default=200,
+                        help="Requests per sweep point")
+    parser.add_argument("--num-warmup", type=int, default=20,
+                        help="Warmup requests before timing (not counted)")
+    parser.add_argument("--results-dir", default="results")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="TPS sweep: vary concurrency without restarting vLLM"
+        description="TPS sweep: isolate decode or prefill throughput"
     )
-    parser.add_argument("--model", required=True,
-                        help="--served-model-name value used when launching vLLM")
-    parser.add_argument("--base-url", default="http://localhost:8000")
-    parser.add_argument("--batch-sizes", default="1,2,4,8,16,32,64,128,256,512,1024,2048,4096",
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    # -- decode --
+    p_dec = subparsers.add_parser("decode",
+        help="Isolate decode throughput (shared prefix, sweep batch sizes)")
+    _add_common_args(p_dec)
+    p_dec.add_argument("--batch-sizes", default="1,64,128,256,512",
                         help="Comma-separated concurrency levels to sweep")
-    parser.add_argument("--input-len", type=int, default=1024,
+    p_dec.add_argument("--input-len", type=int, default=512,
+                        help="Prompt length in tokens (shared across requests)")
+    p_dec.add_argument("--output-len", type=int, default=1024,
+                        help="max_tokens per request")
+
+    # -- prefill --
+    p_pre = subparsers.add_parser("prefill",
+        help="Isolate prefill throughput (unique prompts, sweep input lengths)")
+    _add_common_args(p_pre)
+    p_pre.add_argument("--input-lens", default="4096,16384,32768,65536",
+                        help="Comma-separated input lengths to sweep")
+    p_pre.add_argument("--batch-sizes", default="1,16,64",
+                        help="Concurrency levels per input length")
+    p_pre.add_argument("--output-len", type=int, default=8,
+                        help="max_tokens per request (keep small)")
+
+    # -- combined (legacy) --
+    p_comb = subparsers.add_parser("combined",
+        help="Original combined test (unique prompts, sweep batch sizes)")
+    _add_common_args(p_comb)
+    p_comb.add_argument("--batch-sizes", default="1,2,4,8,16,32,64,128,256,512,1024,2048,4096",
+                        help="Comma-separated concurrency levels to sweep")
+    p_comb.add_argument("--input-len", type=int, default=1024,
                         help="Target prompt length in tokens (ISL)")
-    parser.add_argument("--output-len", type=int, default=1024,
+    p_comb.add_argument("--output-len", type=int, default=1024,
                         help="max_tokens per request (OSL cap)")
-    parser.add_argument("--num-prompts", type=int, default=200,
-                        help="Requests per batch-size point")
-    parser.add_argument("--num-warmup", type=int, default=20,
-                        help="Warmup requests before timing (not counted)")
-    parser.add_argument("--results-dir", default="results")
+
     args = parser.parse_args()
-    asyncio.run(_run(args))
+
+    if args.mode == "decode":
+        asyncio.run(_run_decode(args))
+    elif args.mode == "prefill":
+        asyncio.run(_run_prefill(args))
+    else:
+        asyncio.run(_run_combined(args))
 
 
 if __name__ == "__main__":

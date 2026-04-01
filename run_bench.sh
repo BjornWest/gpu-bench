@@ -6,7 +6,7 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/models.conf"
+source "$SCRIPT_DIR/sweep.conf"
 
 MODEL_NAME="${1:?Usage: run_bench.sh <model_name>}"
 SERVE_SCRIPT="$SCRIPT_DIR/models/$MODEL_NAME/serve.sh"

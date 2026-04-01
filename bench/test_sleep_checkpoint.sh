@@ -24,7 +24,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
-source "$ROOT_DIR/models.conf"
+source "$ROOT_DIR/sweep.conf"
 
 PORT="${1:-${PORT:-8000}}"
 HOST="${HOST:-localhost}"

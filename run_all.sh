@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Run the TPS sweep for every model in ALL_MODELS (defined in models.conf).
+# Run the TPS sweep for every model in ALL_MODELS (defined in sweep.conf).
 #
 # Usage:  bash run_all.sh
 # Single model: bash run_bench.sh <model_name>
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/models.conf"
+source "$SCRIPT_DIR/sweep.conf"
 
 FAILED=()
 
