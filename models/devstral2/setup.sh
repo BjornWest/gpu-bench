@@ -12,7 +12,7 @@ uv pip install "vllm>=0.9.0"
 uv pip install hf-transfer huggingface_hub
 
 # Download weights to local directory
-HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download \
+HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
     "mistralai/Devstral-2-123B" \
     --include "model-*.safetensors" "model.safetensors.index.json" "config.json" "tokenizer*" "*.jinja" "generation_config.json" \
     --exclude "consolidated*" \

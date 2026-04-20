@@ -15,7 +15,7 @@ curl -O https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8/raw/
 
 
 # Download weights to local directory
-HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download \
+HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8" \
     --local-dir "$MODEL_DIR/model"
 

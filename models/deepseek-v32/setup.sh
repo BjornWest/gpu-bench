@@ -15,7 +15,7 @@ uv pip install git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3 --no
 uv pip install hf-transfer huggingface_hub
 
 # Download weights to local directory
-HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download \
+HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
     "QuantTrio/DeepSeek-V3.2-AWQ" \
     --local-dir "$MODEL_DIR/model"
 

@@ -26,18 +26,17 @@ export VLLM_SERVER_DEV_MODE=1
 exec vllm serve \
     "$MODEL_DIR/model" \
     --served-model-name MY_MODEL \
-    --swap-space 16 \
-    --max-num-seqs 32 \
+    --max-num-seqs 500 \
     --max-model-len 32768  \
     --gpu-memory-utilization 0.9 \
     --tensor-parallel-size 8 \
-    --enable-expert-parallel \ 
-    --enable-auto-tool-choice \    
+    --enable-expert-parallel \
+    --enable-auto-tool-choice \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
     --trust-remote-code \
-    --host 0.0.0.0 \
+    --host 127.0.0.1 \
     --port 8000 \
     --enable-prompt-tokens-details \
     --enable-sleep-mode

@@ -16,7 +16,7 @@ uv pip install "vllm>=0.9.0"
 uv pip install hf-transfer huggingface_hub
 
 # Download weights to local directory
-HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download \
+HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
     "MiniMaxAI/MiniMax-M2.5" \
     --local-dir "$MODEL_DIR/model"
 
